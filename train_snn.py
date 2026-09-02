@@ -39,11 +39,12 @@ SPLIT_MANIFEST_PATH = (
     "/home/wxy/Classification/syy/syy/strock_test/OCTA_pytorch/"
     "OCTA_SNN/feature_out/split_manifest.csv"
 )
-SAVE_ROOT = os.path.join(SCRIPT_DIR, "output")
+SAVE_ROOT = os.path.join(SCRIPT_DIR, "output_improved")
 
 SEED = 42
 OUTER_FOLDS = 5
 INNER_FOLDS = 5
+INNER_SEEDS = 3
 FINAL_SEEDS = 3
 
 ORIG_H = 1216
@@ -56,7 +57,9 @@ CSV_CHUNK_SIZE = 50_000
 CACHE_VERSION = (
     f"v1_t{TIME_BINS}_h{VOXEL_H}_w{VOXEL_W}_e{MAX_EVENTS}"
 )
-CACHE_ROOT = os.path.join(SAVE_ROOT, "voxel_cache", CACHE_VERSION)
+CACHE_ROOT = os.path.join(
+    SCRIPT_DIR, "output", "voxel_cache", CACHE_VERSION
+)
 
 BATCH_SIZE = 8
 NUM_WORKERS = 4
@@ -69,8 +72,12 @@ GRAD_CLIP = 5.0
 LIF_BETA = 0.85
 LIF_THRESHOLD = 1.0
 DROPOUT = 0.25
+SNN_CHANNELS = (24, 48, 96)
+READOUT_HIDDEN = 128
+LABEL_SMOOTHING = 0.05
 THRESHOLD_GRID = np.arange(0.0, 1.001, 0.01)
 THRESHOLD_OBJECTIVE = "balanced_acc"
+CHECKPOINT_OBJECTIVE = "auc_ap_loss"
 VIDEO_AGGREGATION = "median"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -143,12 +150,15 @@ def get_git_commit():
 def build_config_snapshot():
     config_names = [
         "DATA_ROOT", "SPLIT_MANIFEST_PATH", "SAVE_ROOT", "SEED",
-        "OUTER_FOLDS", "INNER_FOLDS", "FINAL_SEEDS", "ORIG_H", "ORIG_W",
+        "OUTER_FOLDS", "INNER_FOLDS", "INNER_SEEDS", "FINAL_SEEDS",
+        "ORIG_H", "ORIG_W",
         "VOXEL_H", "VOXEL_W", "TIME_BINS", "MAX_EVENTS",
-        "CSV_CHUNK_SIZE", "CACHE_VERSION", "BATCH_SIZE", "NUM_WORKERS",
+        "CSV_CHUNK_SIZE", "CACHE_VERSION", "CACHE_ROOT", "BATCH_SIZE",
+        "NUM_WORKERS",
         "MAX_SEGMENTS_PER_VIDEO", "EPOCHS", "EARLY_STOP_PATIENCE",
         "LEARNING_RATE", "WEIGHT_DECAY", "GRAD_CLIP", "LIF_BETA",
-        "LIF_THRESHOLD", "DROPOUT", "THRESHOLD_OBJECTIVE",
+        "LIF_THRESHOLD", "DROPOUT", "SNN_CHANNELS", "READOUT_HIDDEN",
+        "LABEL_SMOOTHING", "THRESHOLD_OBJECTIVE", "CHECKPOINT_OBJECTIVE",
         "VIDEO_AGGREGATION",
     ]
     config = {"source_file": os.path.abspath(__file__)}
@@ -595,22 +605,35 @@ class ConvSNN(nn.Module):
         super().__init__()
         self.beta = float(beta)
         self.threshold = float(threshold)
-        self.conv1 = nn.Conv2d(2, 16, 5, stride=2, padding=2, bias=False)
-        self.norm1 = nn.GroupNorm(4, 16)
-        self.conv2 = nn.Conv2d(16, 32, 3, stride=2, padding=1, bias=False)
-        self.norm2 = nn.GroupNorm(8, 32)
-        self.conv3 = nn.Conv2d(32, 64, 3, stride=2, padding=1, bias=False)
-        self.norm3 = nn.GroupNorm(8, 64)
+        channel1, channel2, channel3 = SNN_CHANNELS
+        self.conv1 = nn.Conv2d(
+            2, channel1, 5, stride=2, padding=2, bias=False
+        )
+        self.norm1 = nn.GroupNorm(6, channel1)
+        self.conv2 = nn.Conv2d(
+            channel1, channel2, 3, stride=2, padding=1, bias=False
+        )
+        self.norm2 = nn.GroupNorm(8, channel2)
+        self.conv3 = nn.Conv2d(
+            channel2, channel3, 3, stride=2, padding=1, bias=False
+        )
+        self.norm3 = nn.GroupNorm(12, channel3)
         self.pool = nn.AdaptiveAvgPool2d(1)
-        self.dropout = nn.Dropout(DROPOUT)
-        self.classifier = nn.Linear(64, 2)
+        readout_features = channel3 * 4
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(readout_features),
+            nn.Linear(readout_features, READOUT_HIDDEN),
+            nn.GELU(),
+            nn.Dropout(DROPOUT),
+            nn.Linear(READOUT_HIDDEN, 2),
+        )
 
     def forward(self, voxel_sequence):
         mem1 = None
         mem2 = None
         mem3 = None
-        readout_membrane = None
-        readouts = []
+        spike_features = []
+        membrane_features = []
         for time_index in range(voxel_sequence.shape[1]):
             current1 = self.norm1(self.conv1(voxel_sequence[:, time_index]))
             spike1, mem1 = lif_step(
@@ -624,13 +647,21 @@ class ConvSNN(nn.Module):
             spike3, mem3 = lif_step(
                 current3, mem3, self.beta, self.threshold
             )
-            features = self.pool(spike3).flatten(1)
-            current_out = self.classifier(self.dropout(features))
-            if readout_membrane is None:
-                readout_membrane = torch.zeros_like(current_out)
-            readout_membrane = self.beta * readout_membrane + current_out
-            readouts.append(readout_membrane)
-        return torch.stack(readouts, dim=0).mean(dim=0)
+            spike_features.append(self.pool(spike3).flatten(1))
+            membrane_features.append(self.pool(mem3).flatten(1))
+
+        spike_sequence = torch.stack(spike_features, dim=1)
+        membrane_sequence = torch.stack(membrane_features, dim=1)
+        readout = torch.cat(
+            [
+                spike_sequence.mean(dim=1),
+                spike_sequence.amax(dim=1),
+                membrane_sequence.mean(dim=1),
+                membrane_sequence.std(dim=1, unbiased=False),
+            ],
+            dim=1,
+        )
+        return self.classifier(readout)
 
 
 def class_weights_from_samples(samples):
@@ -768,14 +799,16 @@ def train_with_validation(
     outer_fold,
     inner_fold,
     save_dir,
+    seed_index,
 ):
-    seed = SEED + outer_fold * 1000 + inner_fold
+    seed = SEED + outer_fold * 1000 + inner_fold * 10 + seed_index
     seed_everything(seed)
     train_loader = make_loader(train_samples, seed, train=True)
     val_loader = make_loader(val_samples, seed + 1, train=False)
     model = ConvSNN().to(DEVICE)
     loss_fn = nn.CrossEntropyLoss(
-        weight=class_weights_from_samples(train_samples)
+        weight=class_weights_from_samples(train_samples),
+        label_smoothing=LABEL_SMOOTHING,
     )
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -809,8 +842,8 @@ def train_with_validation(
             balanced_accuracy_score(val_label, val_pred)
         )
         score = (
-            val_ap if np.isfinite(val_ap) else -float("inf"),
             val_auc if np.isfinite(val_auc) else -float("inf"),
+            val_ap if np.isfinite(val_ap) else -float("inf"),
             -float(val_loss),
         )
         checkpoint_saved = int(best_score is None or score > best_score)
@@ -865,7 +898,8 @@ def train_fixed(train_samples, epochs, seed):
     loader = make_loader(train_samples, seed, train=True)
     model = ConvSNN().to(DEVICE)
     loss_fn = nn.CrossEntropyLoss(
-        weight=class_weights_from_samples(train_samples)
+        weight=class_weights_from_samples(train_samples),
+        label_smoothing=LABEL_SMOOTHING,
     )
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -930,9 +964,15 @@ def save_model_bundle(
             "lif_beta": LIF_BETA,
             "lif_threshold": LIF_THRESHOLD,
             "dropout": DROPOUT,
+            "snn_channels": list(SNN_CHANNELS),
+            "readout_hidden": READOUT_HIDDEN,
+            "label_smoothing": LABEL_SMOOTHING,
             "max_events": MAX_EVENTS,
             "cache_version": CACHE_VERSION,
             "video_aggregation": VIDEO_AGGREGATION,
+            "inner_seeds": INNER_SEEDS,
+            "final_seeds": FINAL_SEEDS,
+            "checkpoint_objective": CHECKPOINT_OBJECTIVE,
         },
         "outer_fold": int(outer_fold),
         "selected_epoch": int(selected_epoch),
@@ -1058,17 +1098,36 @@ def main():
             inner_dir = os.path.join(
                 fold_root, f"inner_fold_{inner_fold}"
             )
-            _, best_epoch, val_video, epoch_rows = train_with_validation(
-                inner_train_samples,
+            inner_state_dicts = []
+            inner_seed_epochs = []
+            for seed_index in range(INNER_SEEDS):
+                seed_dir = os.path.join(
+                    inner_dir, f"seed_{seed_index + 1}"
+                )
+                state_dict, best_epoch, _, epoch_rows = train_with_validation(
+                    inner_train_samples,
+                    inner_val_samples,
+                    outer_fold,
+                    inner_fold,
+                    seed_dir,
+                    seed_index,
+                )
+                inner_state_dicts.append(state_dict)
+                inner_seed_epochs.append(best_epoch)
+                all_epoch_rows.extend(epoch_rows)
+
+            val_video = predict_state_ensemble(
+                inner_state_dicts,
                 inner_val_samples,
-                outer_fold,
-                inner_fold,
-                inner_dir,
+                SEED + outer_fold * 100 + inner_fold * 10,
             )
-            best_epochs.append(best_epoch)
+            best_epochs.extend(inner_seed_epochs)
             val_video["inner_fold"] = inner_fold
             oof_parts.append(val_video)
-            all_epoch_rows.extend(epoch_rows)
+            print(
+                f"outer={outer_fold} inner={inner_fold} "
+                f"ensemble_epochs={inner_seed_epochs}"
+            )
 
         inner_oof = pd.concat(oof_parts, ignore_index=True)
         if inner_oof["video_key"].duplicated().any():
